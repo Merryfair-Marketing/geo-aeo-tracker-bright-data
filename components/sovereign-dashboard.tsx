@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { loadSovereignValue, saveSovereignValue, clearSovereignStore } from "@/lib/client/sovereign-store";
+import { loadSovereignValue, saveSovereignValue, clearSovereignStore, subscribeSyncStatus, getSyncStatus, type SyncStatus } from "@/lib/client/sovereign-store";
 import { DEMO_STATE } from "@/lib/demo-data";
 import { AeoAuditTab } from "@/components/dashboard/tabs/aeo-audit-tab";
 import { AutomationTab } from "@/components/dashboard/tabs/automation-tab-v2";
@@ -246,11 +246,15 @@ export function SovereignDashboard({ demoMode = false }: { demoMode?: boolean } 
   const [state, setState] = useState<AppState>(demoMode ? DEMO_STATE : defaultState);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState(demoMode ? "Demo mode — read-only preview" : "");
+  const [syncStatus, setSyncStatus] = useState<SyncStatus>(getSyncStatus());
   const [theme, setTheme] = useState<"light" | "dark" | "system">("system");
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [activeWsId, setActiveWsId] = useState<string>("default");
   const [showWsPicker, setShowWsPicker] = useState(false);
   const [showScoreInfo, setShowScoreInfo] = useState(false);
+  /** Subscribe to Supabase sync status */
+  useEffect(() => subscribeSyncStatus(setSyncStatus), []);
+
   /** Blocks the save effect from firing before the initial load from IndexedDB completes */
   const isLoaded = useRef(false);
 
@@ -1546,8 +1550,19 @@ Now analyze all ${competitorList.length} competitors:`,
             {themeIcon}
           </button>
 
-          <span className={`rounded-md px-2.5 py-1 text-xs ${busy ? "animate-pulse bg-th-accent-soft text-th-text-accent" : "bg-th-card-alt text-th-text-muted"}`}>
-            {message || "Ready"}
+          <span className={`rounded-md px-2.5 py-1 text-xs ${
+            busy || syncStatus === "syncing"
+              ? "animate-pulse bg-th-accent-soft text-th-text-accent"
+              : syncStatus === "error"
+              ? "bg-red-100 text-red-600 dark:bg-red-900/30 dark:text-red-400"
+              : "bg-th-card-alt text-th-text-muted"
+          }`}>
+            {message || (
+              syncStatus === "syncing" ? "Syncing to cloud…" :
+              syncStatus === "synced"  ? "Saved to cloud" :
+              syncStatus === "error"   ? "Sync failed — check connection" :
+              "Ready"
+            )}
           </span>
         </header>
 

@@ -3,6 +3,62 @@
 import { get, set, del } from "idb-keyval";
 import { supabase } from "./supabase";
 
+// ── Sync status ──────────────────────────────────────────────────────
+export type SyncStatus = "idle" | "syncing" | "synced" | "error";
+
+let currentSyncStatus: SyncStatus = "idle";
+const statusListeners = new Set<(s: SyncStatus) => void>();
+
+function emitSyncStatus(s: SyncStatus) {
+  currentSyncStatus = s;
+  statusListeners.forEach((fn) => fn(s));
+}
+
+export function getSyncStatus(): SyncStatus {
+  return currentSyncStatus;
+}
+
+export function subscribeSyncStatus(fn: (s: SyncStatus) => void): () => void {
+  statusListeners.add(fn);
+  return () => statusListeners.delete(fn);
+}
+
+// ── Debounced Supabase writes ────────────────────────────────────────
+const pendingTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+async function upsertWithRetry(key: string, value: unknown, attempts = 3): Promise<void> {
+  for (let i = 0; i < attempts; i++) {
+    const { error } = await supabase!
+      .from("app_data")
+      .upsert({ key, value, updated_at: new Date().toISOString() });
+    if (!error) return;
+    if (i < attempts - 1) {
+      await new Promise((r) => setTimeout(r, 500 * 2 ** i)); // 500ms, 1s, 2s
+    } else {
+      throw error;
+    }
+  }
+}
+
+function scheduleSupabaseSync(key: string, value: unknown) {
+  clearTimeout(pendingTimers.get(key));
+  pendingTimers.set(
+    key,
+    setTimeout(async () => {
+      emitSyncStatus("syncing");
+      try {
+        await upsertWithRetry(key, value);
+        emitSyncStatus("synced");
+        setTimeout(() => emitSyncStatus("idle"), 3000);
+      } catch {
+        emitSyncStatus("error");
+      }
+    }, 800),
+  );
+}
+
+// ── Public API ───────────────────────────────────────────────────────
+
 /**
  * Load state — Supabase is the source of truth when available.
  * Falls back to IndexedDB → localStorage for offline or pre-migration data.
@@ -18,7 +74,6 @@ export async function loadSovereignValue<T>(key: string, fallback: T): Promise<T
         .maybeSingle();
 
       if (!error && data?.value !== undefined) {
-        // Cache locally so the app works offline
         await set(key, data.value).catch(() => {});
         return data.value as T;
       }
@@ -51,7 +106,7 @@ export async function loadSovereignValue<T>(key: string, fallback: T): Promise<T
 
 /**
  * Save state — writes to IndexedDB immediately (fast, local cache),
- * then syncs to Supabase in the background (cloud persistence).
+ * then debounces and retries a sync to Supabase (cloud persistence).
  */
 export async function saveSovereignValue<T>(key: string, value: T): Promise<void> {
   // Always write locally first so the UI never waits on the network
@@ -64,14 +119,9 @@ export async function saveSovereignValue<T>(key: string, value: T): Promise<void
     try { window.localStorage.removeItem(key); } catch { /* ignore */ }
   }
 
-  // Sync to Supabase in the background — don't block the UI
+  // Debounced, retriable sync to Supabase — coalesces rapid state changes
   if (supabase) {
-    supabase
-      .from("app_data")
-      .upsert({ key, value, updated_at: new Date().toISOString() })
-      .then(({ error }) => {
-        if (error) console.warn("[supabase] sync failed:", error.message);
-      });
+    scheduleSupabaseSync(key, value);
   }
 }
 
@@ -79,10 +129,15 @@ export async function clearSovereignStore(key: string): Promise<void> {
   try { window.localStorage.removeItem(key); } catch { /* ignore */ }
   await del(key);
 
-  // Also delete from Supabase
   if (supabase) {
-    supabase.from("app_data").delete().eq("key", key).then(({ error }) => {
-      if (error) console.warn("[supabase] delete failed:", error.message);
-    });
+    emitSyncStatus("syncing");
+    try {
+      const { error } = await supabase.from("app_data").delete().eq("key", key);
+      if (error) throw error;
+      emitSyncStatus("synced");
+      setTimeout(() => emitSyncStatus("idle"), 3000);
+    } catch {
+      emitSyncStatus("error");
+    }
   }
 }
